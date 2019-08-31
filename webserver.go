@@ -1,13 +1,19 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
+
+	"github.com/alexbrainman/sspi"
+	"github.com/alexbrainman/sspi/ntlm"
 )
 
 type application struct {
@@ -15,7 +21,6 @@ type application struct {
 }
 
 func (handler application) ServeHTTP(w http.ResponseWriter, r *request) {
-	fmt.Printf("basePath=%v\nsegments=%v\n", r.basePath, r.segments)
 	in := r.URL.Path[len(r.basePath):]
 	out := filepath.Join(handler.filePath, filepath.Clean(in))
 	if fileInfo, err := os.Stat(out); err != nil && os.IsNotExist(err) {
@@ -91,11 +96,51 @@ func (f handlerFunc) ServeHTTP(w http.ResponseWriter, r *request) {
 }
 
 func userInfo(w http.ResponseWriter, r *request) {
-	fmt.Printf("basePath=%v\nsegments=%v\n", r.basePath, r.segments)
-	fmt.Fprint(w, "userInfo")
+	var err error
+	auth := r.Header.Get("Authorization")
+	if auth == "" || (len(strings.SplitN(auth, " ", 2)) < 2) {
+		initiateNTLM(w)
+		return
+	}
+	parts := strings.SplitN(auth, " ", 2)
+	authType := parts[0]
+	if authType != "NTLM" {
+		initiateNTLM(w)
+		return
+	}
+	var authPayload []byte
+	authPayload, err = base64.StdEncoding.DecodeString(parts[1])
+	context, ok := contexts[r.RemoteAddr]
+	if !ok {
+		sendChallenge(authPayload, w, r)
+		return
+	}
+	defer delete(contexts, r.RemoteAddr)
+	var u *user.User
+	u, err = authenticate(context, authPayload)
+	if err != nil {
+		log.Println("auth error:", err)
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if !authorize(u, r) {
+		http.Error(w, u.Username+" is not authorized to do that", http.StatusUnauthorized)
+	}
+	name := u.Name
+	if name == "" {
+		name = u.Username
+	}
+	fmt.Fprint(w, "Hello, "+name)
 }
 
 func main() {
+	var port string
+	if envPort, exists := os.LookupEnv("PORT"); exists {
+		port = envPort
+	} else {
+		port = "8080"
+	}
+
 	mux := router{}
 	mux.Handle("gameoflife", application{filePath: "gameoflife"})
 	mux.Handle("components", application{filePath: "components"})
@@ -104,26 +149,26 @@ func main() {
 	userMux.Handle("info", handlerFunc(userInfo))
 	mux.Handle("user", userMux)
 
-	fmt.Println("listening on http://localhost:8080/gameoflife")
-	fmt.Println("listening on http://localhost:8080/components")
+	fmt.Println("listening on http://localhost:" + port + "/gameoflife")
+	fmt.Println("listening on http://localhost:" + port + "/components")
+	fmt.Println("listening on http://localhost:" + port + "/user/info")
 
 	test := false
 
 	if test {
 		go func() {
-			err := http.ListenAndServe(":8080", mux)
+			err := http.ListenAndServe(":"+port, mux)
 			log.Fatal(err)
 		}()
 
 		client := &http.Client{}
 		headers := make(map[string]string)
 
-		testGet(client, "http://localhost:8080/gameoflife", headers)
-		testGet(client, "http://localhost:8080/components", headers)
-		testGet(client, "http://localhost:8080/user/info", headers)
-		testGet(client, "http://localhost:8080/user/info/1", headers)
+		testGet(client, "http://localhost:"+port+"/gameoflife", headers)
+		testGet(client, "http://localhost:"+port+"/components", headers)
+		testGet(client, "http://localhost:"+port+"/user/info", headers)
 	} else {
-		err := http.ListenAndServe(":8080", mux)
+		err := http.ListenAndServe(":"+port, mux)
 		log.Fatal(err)
 	}
 }
@@ -150,5 +195,59 @@ func handleResponse(resp *http.Response, err error) (data map[string]interface{}
 			}
 		}
 	}
+	return
+}
+
+var (
+	contexts    map[string]*ntlm.ServerContext
+	serverCreds *sspi.Credentials
+)
+
+func init() {
+	contexts = make(map[string]*ntlm.ServerContext)
+	var err error
+	serverCreds, err = ntlm.AcquireServerCredentials()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func initiateNTLM(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", "NTLM")
+	http.Error(w, "Authorization required", http.StatusUnauthorized)
+	return
+}
+
+func authenticate(c *ntlm.ServerContext, authenticate []byte) (u *user.User, err error) {
+	defer c.Release()
+	err = c.Update(authenticate)
+	if err != nil {
+		return
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	err = c.ImpersonateUser()
+	if err != nil {
+		return
+	}
+	defer c.RevertToSelf()
+	u, err = user.Current()
+	return
+}
+
+func authorize(u *user.User, r *request) bool {
+	fmt.Println(u.Uid+" ("+u.Username+") really wants ", r.URL.String())
+	return true
+}
+
+func sendChallenge(negotiate []byte, w http.ResponseWriter, r *request) {
+	sc, ch, err := ntlm.NewServerContext(serverCreds, negotiate)
+	if err != nil {
+		http.Error(w, "NTLM error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	contexts[r.RemoteAddr] = sc
+	w.Header().Set("WWW-Authenticate", "NTLM "+base64.StdEncoding.EncodeToString(ch))
+	http.Error(w, "Respond to challenge", http.StatusUnauthorized)
 	return
 }
