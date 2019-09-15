@@ -1,16 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/alexbrainman/sspi"
 	"github.com/alexbrainman/sspi/ntlm"
@@ -141,6 +143,24 @@ func main() {
 		port = "8080"
 	}
 
+	server := createServer(port)
+	go startServer(server)
+	fmt.Println("listening on http://localhost:" + port + "/gameoflife")
+	fmt.Println("listening on http://localhost:" + port + "/components")
+	fmt.Println("listening on http://localhost:" + port + "/user/info")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+	<-stop
+}
+
+func startServer(server *http.Server) {
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func createServer(port string) *http.Server {
 	mux := router{}
 	mux.Handle("gameoflife", application{filePath: "gameoflife"})
 	mux.Handle("components", application{filePath: "components"})
@@ -149,53 +169,15 @@ func main() {
 	userMux.Handle("info", handlerFunc(userInfo))
 	mux.Handle("user", userMux)
 
-	fmt.Println("listening on http://localhost:" + port + "/gameoflife")
-	fmt.Println("listening on http://localhost:" + port + "/components")
-	fmt.Println("listening on http://localhost:" + port + "/user/info")
+	return &http.Server{Addr: ":" + port, Handler: mux}
+}
 
-	test := false
-
-	if test {
-		go func() {
-			err := http.ListenAndServe(":"+port, mux)
-			log.Fatal(err)
-		}()
-
-		client := &http.Client{}
-		headers := make(map[string]string)
-
-		testGet(client, "http://localhost:"+port+"/gameoflife", headers)
-		testGet(client, "http://localhost:"+port+"/components", headers)
-		testGet(client, "http://localhost:"+port+"/user/info", headers)
-	} else {
-		err := http.ListenAndServe(":"+port, mux)
+func stopServer(server *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func testGet(client *http.Client, url string, headers map[string]string) {
-	fmt.Println(url)
-	req, _ := http.NewRequest("GET", url, nil)
-	for k, v := range headers {
-		req.Header.Add(k, v)
-	}
-	handleResponse(client.Do(req))
-}
-
-func handleResponse(resp *http.Response, err error) (data map[string]interface{}) {
-	if err != nil {
-		fmt.Println(err)
-	} else {
-		defer resp.Body.Close()
-		fmt.Println(resp.Status)
-		if resp.StatusCode == 200 {
-			body, _ := ioutil.ReadAll(resp.Body)
-			if len(body) > 0 {
-				fmt.Println(string(body))
-			}
-		}
-	}
-	return
 }
 
 var (
@@ -236,7 +218,6 @@ func authenticate(c *ntlm.ServerContext, authenticate []byte) (u *user.User, err
 }
 
 func authorize(u *user.User, r *request) bool {
-	fmt.Println(u.Uid+" ("+u.Username+") really wants ", r.URL.String())
 	return true
 }
 
